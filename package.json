@@ -1,0 +1,17 @@
+{
+  "name": "clawmind-skill",
+  "version": "1.0.0",
+  "description": "ClawMind Local Skill - Lobster Workflow Interceptor for OpenClaw",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "undici": "^7.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
