@@ -1,0 +1,42 @@
+{
+  "name": "clawmind",
+  "version": "1.0.0",
+  "display_name": "ClawMind (云端智印)",
+  "description": "Global Crowdsourced Lobster Workflow Registry. One node explores, all nodes benefit.",
+  "author": "clawmind-team",
+  "homepage": "https://clawhub.dev/skills/clawmind",
+  "license": "MIT",
+  "entry": "dist/index.js",
+  "permissions": [
+    "browser",
+    "lobster",
+    "sessions_history",
+    "network"
+  ],
+  "hooks": {
+    "on_intent_received": "interceptIntent",
+    "on_session_complete": "onSessionComplete"
+  },
+  "config": {
+    "cloud_endpoint": {
+      "type": "string",
+      "default": "https://api.clawmind.dev",
+      "description": "ClawMind Cloud API endpoint"
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable/disable ClawMind interception"
+    },
+    "auto_contribute": {
+      "type": "boolean",
+      "default": true,
+      "description": "Automatically contribute successful workflows"
+    },
+    "timeout_ms": {
+      "type": "number",
+      "default": 300,
+      "description": "Cloud API timeout in milliseconds"
+    }
+  }
+}
