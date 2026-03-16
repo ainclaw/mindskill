@@ -13,6 +13,8 @@
 import { CloudClient } from "./cloud-client.js";
 import { parseIntent } from "./intent-parser.js";
 import { compileTrace } from "./trace-compiler.js";
+import { generateEmbedding } from "./embedding.js";
+import { sanitizeDomSnapshot } from "./sanitizer.js";
 import type {
   OpenClawContext,
   MatchResponse,
@@ -48,18 +50,34 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
 
   logger.info(`[ClawMind] Intercepting intent: "${parsed.normalized}" on ${parsed.domain}`);
 
+  // Generate intent embedding for semantic matching
+  let intentEmbedding: number[] | undefined;
+  try {
+    intentEmbedding = await generateEmbedding(parsed.normalized, cloudEndpoint, 2000);
+    if (intentEmbedding) {
+      logger.debug(`[ClawMind] Generated embedding vector (${intentEmbedding.length} dims)`);
+    } else {
+      logger.debug(`[ClawMind] Embedding generation failed, using exact match only`);
+    }
+  } catch (err) {
+    logger.debug(`[ClawMind] Embedding error: ${err}`);
+  }
+
+  // Ensure dom_skeleton_hash is not empty string
+  const cleanDomHash = domHash && domHash.trim() !== "" ? domHash : undefined;
+
   // Query cloud for a matching macro
   let matchResult: MatchResponse | null = null;
   try {
     matchResult = await client.match({
       intent: parsed.normalized,
+      intent_embedding: intentEmbedding,
       url,
-      dom_skeleton_hash: domHash,
+      dom_skeleton_hash: cleanDomHash,
       node_id: nodeId,
     });
-  } catch {
-    // Cloud unavailable — graceful degradation, just passthrough
-    logger.debug("[ClawMind] Cloud unreachable, passing through");
+  } catch (err) {
+    logger.debug(`[ClawMind] Cloud unreachable: ${err}`);
     gateway.passthrough();
     return;
   }
@@ -90,12 +108,22 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
   } catch (err) {
     logger.error(`[ClawMind] Lobster execution threw: ${err}`);
 
+    // P2: Get DOM snapshot on failure and sanitize
+    let domSnapshot: string | undefined;
+    try {
+      const rawDom = await browser.invoke("getOuterHTML", {});
+      if (rawDom.success && typeof rawDom.data === "string") {
+        domSnapshot = sanitizeDomSnapshot(rawDom.data);
+      }
+    } catch {}
+
     // Report failure to cloud (fire-and-forget)
     client.reportFailure({
       macro_id: macro.macro_id,
       node_id: nodeId,
       error_type: "other",
       error_detail: String(err),
+      dom_snapshot: domSnapshot,
     }).catch(() => {});
 
     // Fall back to normal OpenClaw flow
@@ -119,11 +147,22 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
     // Map error to error_type
     const errorType = mapErrorType(execResult.error || "");
 
+    // P2: Get DOM snapshot on failure and sanitize
+    let domSnapshot: string | undefined;
+    try {
+      const rawDom = await browser.invoke("getOuterHTML", {});
+      if (rawDom.success && typeof rawDom.data === "string") {
+        domSnapshot = sanitizeDomSnapshot(rawDom.data);
+      }
+    } catch {}
+
     client.reportFailure({
       macro_id: macro.macro_id,
       node_id: nodeId,
       error_type: errorType,
       error_detail: execResult.error,
+      dom_snapshot: domSnapshot,
+      failed_step_id: execResult.failed_step_id,
     }).catch(() => {});
 
     // Fall back to normal OpenClaw flow
@@ -172,13 +211,25 @@ export async function onSessionComplete(ctx: OpenClawContext): Promise<void> {
   const cloudEndpoint = config.get<string>("cloud_endpoint");
   const client = new CloudClient(cloudEndpoint, 5000, logger);
 
+  // Generate intent embedding for contribution
+  let intentEmbedding: number[] | undefined;
+  try {
+    intentEmbedding = await generateEmbedding(intent, cloudEndpoint, 2000);
+  } catch (err) {
+    logger.debug(`[ClawMind] Embedding generation failed: ${err}`);
+  }
+
+  // Ensure dom_skeleton_hash is not empty string
+  const cleanDomHash = domHash && domHash.trim() !== "" ? domHash : undefined;
+
   try {
     const result = await client.contribute({
       node_id: nodeId,
       intent,
       url,
-      dom_skeleton_hash: domHash,
+      dom_skeleton_hash: cleanDomHash,
       lobster_workflow: workflow,
+      intent_embedding: intentEmbedding,
       session_id: sessionId,
     });
 

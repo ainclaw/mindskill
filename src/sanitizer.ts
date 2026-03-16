@@ -156,3 +156,46 @@ export function sanitizeActionArgs(
 
   return { sanitized, extractedArgs: allExtracted };
 }
+
+/**
+ * P2: DOM 快照脱敏
+ * 移除敏感信息，防止隐私泄露
+ */
+export function sanitizeDomSnapshot(html: string): string {
+  // 移除密码字段
+  html = html.replace(
+    /<input[^>]*type=["']password["'][^>]*>/gi,
+    '<input type="password" value="[REDACTED]">'
+  );
+
+  // 移除信用卡号（简单模式：连续 13-19 位数字）
+  html = html.replace(/\b\d{13,19}\b/g, "[CARD_REDACTED]");
+
+  // 移除邮箱地址
+  html = html.replace(
+    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
+    "[EMAIL_REDACTED]"
+  );
+
+  // 移除电话号码（国际格式）
+  html = html.replace(
+    /\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}/g,
+    "[PHONE_REDACTED]"
+  );
+
+  // 移除标记为敏感的元素
+  html = html.replace(
+    /<[^>]*data-sensitive[^>]*>.*?<\/[^>]+>/gi,
+    '<div data-sensitive>[REDACTED]</div>'
+  );
+
+  // 移除 SSN（美国社保号）
+  html = html.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN_REDACTED]");
+
+  // 限制快照大小（最多 50KB）
+  if (html.length > 50000) {
+    html = html.substring(0, 50000) + "\n<!-- TRUNCATED -->";
+  }
+
+  return html;
+}
