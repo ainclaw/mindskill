@@ -42,15 +42,15 @@ export async function generateEmbedding(
 
 --- src/interceptor.ts (FIXED) ---
 /**
- * Interceptor — the main hook that fires on every intent.
+ * Interceptor  the main hook that fires on every intent.
  *
  * Flow:
  * 1. User issues an intent (e.g., "login to GitHub")
  * 2. Interceptor queries ClawMind Cloud for a matching Lobster macro
- * 3. If hit → execute the Lobster workflow directly (skip LLM exploration)
- * 4. If miss → passthrough to normal OpenClaw flow
- * 5. On success → contribute the trace back to the cloud
- * 6. On failure → report failure for circuit breaker tracking
+ * 3. If hit  execute the Lobster workflow directly (skip LLM exploration)
+ * 4. If miss  passthrough to normal OpenClaw flow
+ * 5. On success  contribute the trace back to the cloud
+ * 6. On failure  report failure for circuit breaker tracking
  */
 
 import { CloudClient } from "./cloud-client.js";
@@ -125,7 +125,7 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
     return;
   }
 
-  // No match — let OpenClaw handle it normally
+  // No match  let OpenClaw handle it normally
   if (!matchResult || !matchResult.hit || !matchResult.macro) {
     logger.info("[ClawMind] No macro match, passing through to OpenClaw");
     gateway.passthrough();
@@ -179,7 +179,7 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
       `[ClawMind] Macro ${macro.macro_id} executed successfully (${execResult.steps_completed}/${execResult.total_steps} steps)`
     );
     gateway.respond(
-      `✅ Done via ClawMind cached workflow (${macro.macro_id}). ` +
+      ` Done via ClawMind cached workflow (${macro.macro_id}). ` +
       `${execResult.steps_completed} steps replayed.`
     );
   } else {
@@ -304,7 +304,7 @@ function mapErrorType(
 
 --- src/sanitizer.ts (ENHANCED) ---
 /**
- * Local PII sanitizer — the primary privacy gate.
+ * Local PII sanitizer  the primary privacy gate.
  * Runs BEFORE any data leaves the node.
  * Strips all identifiable information from action traces
  * and replaces them with Lobster argument placeholders.
@@ -594,7 +594,7 @@ export class CloudClient {
 
 --- src/intent-parser.ts ---
 /**
- * Intent parser — extracts structured intent from natural language
+ * Intent parser  extracts structured intent from natural language
  * and current browser context. Lightweight local heuristics,
  * no LLM call needed for basic intent normalization.
  */
@@ -662,7 +662,7 @@ export function parseIntent(raw: string, url: string): ParsedIntent {
 
 --- src/trace-compiler.ts ---
 /**
- * Trace Compiler — converts a recorded OpenClaw session trace
+ * Trace Compiler  converts a recorded OpenClaw session trace
  * into a reusable Lobster workflow.
  *
  * This is the core "one node explores, all nodes benefit" engine.
@@ -692,7 +692,7 @@ export function compileTrace(
   let stepIndex = 0;
 
   for (const action of actions) {
-    // Skip failed actions — we only want the successful path
+    // Skip failed actions  we only want the successful path
     if (!action.result.success) continue;
 
     // Skip non-browser actions (internal bookkeeping, etc.)
@@ -1036,7 +1036,7 @@ export { interceptIntent, onSessionComplete } from "./interceptor.js";
   }
 }
 
-#  MindSkill ↔ ClawMind 
+#  MindSkill  ClawMind 
 
 1. ****P0
 2. ** P0 **
@@ -1131,7 +1131,7 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
 
   logger.info(`[ClawMind] Intercepting intent: "${parsed.normalized}" on ${parsed.domain}`);
 
-  // 🔧  1 intent embedding
+  //   1 intent embedding
   let intentEmbedding: number[] | undefined;
   try {
     intentEmbedding = await generateEmbedding(parsed.normalized, cloudEndpoint, 2000);
@@ -1144,7 +1144,7 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
     logger.debug(`[ClawMind] Embedding error: ${err}`);
   }
 
-  // 🔧  2 dom_skeleton_hash 
+  //   2 dom_skeleton_hash 
   const cleanDomHash = domHash && domHash.trim() !== "" ? domHash : undefined;
 
   let matchResult: MatchResponse | null = null;
@@ -1201,7 +1201,7 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
       `[ClawMind] Macro ${macro.macro_id} executed successfully (${execResult.steps_completed}/${execResult.total_steps} steps)`
     );
     gateway.respond(
-      `✅ Done via ClawMind cached workflow (${macro.macro_id}). ` +
+      ` Done via ClawMind cached workflow (${macro.macro_id}). ` +
       `${execResult.steps_completed} steps replayed.`
     );
   } else {
@@ -1256,7 +1256,7 @@ export async function onSessionComplete(ctx: OpenClawContext): Promise<void> {
   const cloudEndpoint = config.get<string>("cloud_endpoint");
   const client = new CloudClient(cloudEndpoint, 5000, logger);
 
-  // 🔧  3 embedding
+  //   3 embedding
   let intentEmbedding: number[] | undefined;
   try {
     intentEmbedding = await generateEmbedding(intent, cloudEndpoint, 2000);
@@ -1264,7 +1264,7 @@ export async function onSessionComplete(ctx: OpenClawContext): Promise<void> {
     logger.debug(`[ClawMind] Embedding generation failed: ${err}`);
   }
 
-  // 🔧  4 dom_skeleton_hash 
+  //   4 dom_skeleton_hash 
   const cleanDomHash = domHash && domHash.trim() !== "" ? domHash : undefined;
 
   try {
@@ -1497,7 +1497,7 @@ export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
       `[ClawMind] Macro ${macro.macro_id} executed successfully (${execResult.steps_completed}/${execResult.total_steps} steps)`
     );
     gateway.respond(
-      `✅ Done via ClawMind cached workflow (${macro.macro_id}). ` +
+      ` Done via ClawMind cached workflow (${macro.macro_id}). ` +
       `${execResult.steps_completed} steps replayed.`
     );
   } else {
@@ -3532,35 +3532,35 @@ curl -X POST http://localhost:3000/v1/feedback \
 
 set -e
 
-echo "🧠 Starting ClawMind..."
+echo " Starting ClawMind..."
 
 # Check environment variables
 if [ -z "$DATABASE_URL" ]; then
-  echo "❌ ERROR: DATABASE_URL not set"
+  echo " ERROR: DATABASE_URL not set"
   exit 1
 fi
 
 # Check database connection
-echo "🔍 Checking database connection..."
+echo " Checking database connection..."
 psql "$DATABASE_URL" -c "SELECT 1;" > /dev/null 2>&1 || {
-  echo "❌ ERROR: Cannot connect to database"
+  echo " ERROR: Cannot connect to database"
   exit 1
 }
 
 # Check pgvector extension
-echo "🔍 Checking pgvector extension..."
+echo " Checking pgvector extension..."
 psql "$DATABASE_URL" -c "SELECT extname FROM pg_extension WHERE extname='vector';" | grep -q vector || {
-  echo "❌ ERROR: pgvector extension not installed"
+  echo " ERROR: pgvector extension not installed"
   echo "Run: psql $DATABASE_URL -c 'CREATE EXTENSION vector;'"
   exit 1
 }
 
 # Run migrations if needed
-echo "🔄 Running migrations..."
+echo " Running migrations..."
 npm run migrate
 
 # Start server
-echo "✅ Starting server on port ${PORT:-3000}..."
+echo " Starting server on port ${PORT:-3000}..."
 exec npm start
 ```
 
@@ -4177,14 +4177,14 @@ async function runMigrations() {
   const databaseUrl = process.env.DATABASE_URL;
   
   if (!databaseUrl) {
-    console.error("❌ DATABASE_URL not set");
+    console.error(" DATABASE_URL not set");
     process.exit(1);
   }
 
   const pool = new Pool({ connectionString: databaseUrl });
 
   try {
-    console.log("🔄 Running migrations...");
+    console.log(" Running migrations...");
 
     // Check pgvector extension
     const extResult = await pool.query(
@@ -4192,7 +4192,7 @@ async function runMigrations() {
     );
 
     if (extResult.rows.length === 0) {
-      console.log("📦 Installing pgvector extension...");
+      console.log(" Installing pgvector extension...");
       await pool.query("CREATE EXTENSION IF NOT EXISTS vector");
     }
 
@@ -4203,7 +4203,7 @@ async function runMigrations() {
     // Execute migration
     await pool.query(migrationSQL);
 
-    console.log("✅ Migrations completed successfully");
+    console.log(" Migrations completed successfully");
 
     // Verify tables
     const tablesResult = await pool.query(`
@@ -4213,13 +4213,13 @@ async function runMigrations() {
       AND table_name IN ('genes', 'macros', 'macro_genes', 'node_reputation')
     `);
 
-    console.log(`✅ Created ${tablesResult.rows.length} tables:`);
+    console.log(` Created ${tablesResult.rows.length} tables:`);
     tablesResult.rows.forEach((row) => {
       console.log(`   - ${row.table_name}`);
     });
 
   } catch (err) {
-    console.error("❌ Migration failed:", err);
+    console.error(" Migration failed:", err);
     process.exit(1);
   } finally {
     await pool.end();
@@ -4238,7 +4238,7 @@ import pg from "pg";
 const { Pool } = pg;
 
 async function verifyEnvironment() {
-  console.log("🔍 Verifying ClawMind environment...\n");
+  console.log(" Verifying ClawMind environment...\n");
 
   const checks = {
     node_version: false,
@@ -4253,7 +4253,7 @@ async function verifyEnvironment() {
   const majorVersion = parseInt(nodeVersion.slice(1).split(".")[0]);
   checks.node_version = majorVersion >= 18;
   console.log(
-    `${checks.node_version ? "✅" : "❌"} Node.js version: ${nodeVersion} ${
+    `${checks.node_version ? "" : ""} Node.js version: ${nodeVersion} ${
       checks.node_version ? "(OK)" : "(requires >=18)"
     }`
   );
@@ -4262,13 +4262,13 @@ async function verifyEnvironment() {
   const databaseUrl = process.env.DATABASE_URL;
   checks.database_url = !!databaseUrl;
   console.log(
-    `${checks.database_url ? "✅" : "❌"} DATABASE_URL: ${
+    `${checks.database_url ? "" : ""} DATABASE_URL: ${
       checks.database_url ? "set" : "not set"
     }`
   );
 
   if (!databaseUrl) {
-    console.log("\n❌ Canno
+    console.log("\n Canno
 
  P0 
 
@@ -4447,7 +4447,7 @@ async function initEmbedder() {
   isInitializing = true;
 
   try {
-    console.log("🔄 Loading embedding model (Xenova/all-MiniLM-L6-v2)...");
+    console.log(" Loading embedding model (Xenova/all-MiniLM-L6-v2)...");
     const { pipeline } = await import("@xenova/transformers");
     
     embedder = await pipeline(
@@ -4459,13 +4459,13 @@ async function initEmbedder() {
       }
     );
     
-    console.log("✅ Embedding model loaded successfully");
+    console.log(" Embedding model loaded successfully");
     isInitializing = false;
     return embedder;
   } catch (err) {
     initError = err as Error;
     isInitializing = false;
-    console.error("❌ Failed to load embedding model:", err);
+    console.error(" Failed to load embedding model:", err);
     throw new Error("Embedding model initialization failed");
   }
 }
@@ -4642,11 +4642,11 @@ export function validateEnv(): Env {
 
   try {
     cachedEnv = envSchema.parse(process.env);
-    console.log("✅ Environment variables validated successfully");
+    console.log(" Environment variables validated successfully");
     return cachedEnv;
   } catch (err) {
     if (err instanceof z.ZodError) {
-      console.error("❌ Environment variable validation failed:");
+      console.error(" Environment variable validation failed:");
       err.errors.forEach((error) => {
         console.error(`  - ${error.path.join(".")}: ${error.message}`);
       });
@@ -4659,11 +4659,11 @@ export function validateEnv(): Env {
         .map((e) => e.path.join("."));
       
       if (missingVars.length > 0) {
-        console.error("\n📋 Missing required environment variables:");
+        console.error("\n Missing required environment variables:");
         missingVars.forEach((v) => console.error(`  - ${v}`));
       }
       
-      console.error("\n💡 Example .env file:");
+      console.error("\n Example .env file:");
       console.error(`
 DATABASE_URL=postgresql://user:password@localhost:5432/clawmind
 PORT=3000
@@ -4812,9 +4812,9 @@ async function start() {
       host: env.HOST,
     });
     
-    app.log.info(`🚀 ClawMind server running on http://${env.HOST}:${env.PORT}`);
-    app.log.info(`📊 Environment: ${env.NODE_ENV}`);
-    app.log.info(`🗄️  Database: ${env.DATABASE_URL.replace(/:[^:@]+@/, ':****@')}`);
+    app.log.info(` ClawMind server running on http://${env.HOST}:${env.PORT}`);
+    app.log.info(` Environment: ${env.NODE_ENV}`);
+    app.log.info(`  Database: ${env.DATABASE_URL.replace(/:[^:@]+@/, ':****@')}`);
   } catch (err) {
     app.log.error("Failed to start server:", err);
     process.exit(1);
@@ -4861,10 +4861,10 @@ pool.on("error", (err) => {
 // 
 pool.query("SELECT NOW()", (err, res) => {
   if (err) {
-    console.error("❌ Database connection failed:", err);
+    console.error(" Database connection failed:", err);
     process.exit(1);
   } else {
-    console.log("✅ Database connected successfully at", res.rows[0].now);
+    console.log(" Database connected successfully at", res.rows[0].now);
   }
 });
 
@@ -4966,82 +4966,82 @@ DB_TIMEOUT=30000
 
 set -e
 
-echo "🚀 ClawMind Setup Script"
+echo " ClawMind Setup Script"
 echo "========================"
 
 #  Node.js 
 NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
 if [ "$NODE_VERSION" -lt 18 ]; then
-  echo "❌ Node.js 18+ required, current: $(node -v)"
+  echo " Node.js 18+ required, current: $(node -v)"
   exit 1
 fi
-echo "✅ Node.js version: $(node -v)"
+echo " Node.js version: $(node -v)"
 
 #  PostgreSQL
 if ! command -v psql &> /dev/null; then
-  echo "❌ PostgreSQL client not found"
+  echo " PostgreSQL client not found"
   exit 1
 fi
-echo "✅ PostgreSQL client found"
+echo " PostgreSQL client found"
 
 #  .env 
 if [ ! -f .env ]; then
-  echo "⚠️  .env file not found, creating from template..."
+  echo "  .env file not found, creating from template..."
   cp .env.example .env
-  echo "📝 Please edit .env file with your configuration"
+  echo " Please edit .env file with your configuration"
   exit 1
 fi
-echo "✅ .env file found"
+echo " .env file found"
 
 # 
 export $(cat .env | grep -v '^#' | xargs)
 
 # 
-echo "🔍 Testing database connection..."
+echo " Testing database connection..."
 if ! psql "$DATABASE_URL" -c "SELECT 1" > /dev/null 2>&1; then
-  echo "❌ Database connection failed"
+  echo " Database connection failed"
   echo "   Please check DATABASE_URL in .env"
   exit 1
 fi
-echo "✅ Database connection successful"
+echo " Database connection successful"
 
 # 
 
 ```bash
 #  pgvector 
-echo "🔍 Checking pgvector extension..."
+echo " Checking pgvector extension..."
 if ! psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS vector" > /dev/null 2>&1; then
-  echo "❌ pgvector extension not available"
+  echo " pgvector extension not available"
   echo "   Install: https://github.com/pgvector/pgvector"
   exit 1
 fi
-echo "✅ pgvector extension ready"
+echo " pgvector extension ready"
 
 # 
-echo "📦 Installing dependencies..."
+echo " Installing dependencies..."
 npm install
 
 # 
-echo "🗄️  Running database migrations..."
+echo "  Running database migrations..."
 npm run db:migrate
 
 #  embedding 
-echo "🤖 Preloading embedding model..."
+echo " Preloading embedding model..."
 node -e "
 const { pipeline } = require('@xenova/transformers');
 pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2').then(() => {
-  console.log('✅ Model downloaded successfully');
+  console.log(' Model downloaded successfully');
   process.exit(0);
 }).catch(err => {
-  console.error('❌ Model download failed:', err);
+  console.error(' Model download failed:', err);
   process.exit(1);
 });
 "
 
 echo ""
-echo "✅ Setup complete!"
+echo " Setup complete!"
 echo ""
-echo "🚀 Start the server:"
+echo " Start the server:"
 echo "   npm run dev    # Development mode"
 echo "   npm start      # Production mode"
 ```
@@ -5248,25 +5248,25 @@ NODE_OPTIONS="--max-old-space-size=4096" npm start
 
 ## 
 
-### ✅  P0 
+###   P0 
 
-1. **✅  Embedding **
+1. **  Embedding **
    -  `@xenova/transformers` 
    - `Xenova/all-MiniLM-L6-v2` (384)
    - 
 
-2. **✅ **
+2. ** **
    -  schema 
    - 
    - 
    - 
 
-3. **✅ **
+3. ** **
    - Zod schema 
    - 
    - 
 
-4. **✅ **
+4. ** **
    - 
    - 
    - 
