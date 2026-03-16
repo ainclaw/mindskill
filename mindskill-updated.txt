@@ -1,0 +1,1039 @@
+========================================
+MINDSKILL - Updated Code (P0+P2 Fixes)
+========================================
+
+Commit: 0a65850b220e26965454f8e15e03fd45f6d27d42
+
+--- src/embedding.ts (NEW) ---
+import { request } from "undici";
+
+/**
+ * 生成 intent 的语义嵌入向量
+ * 优先使用 ClawMind 云端服务，降级到本地零向量
+ */
+export async function generateEmbedding(
+  text: string,
+  cloudEndpoint: string,
+  timeoutMs: number = 2000
+): Promise<number[] | undefined> {
+  try {
+    const { statusCode, body } = await request(`${cloudEndpoint}/v1/embed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
+    });
+
+    if (statusCode !== 200) {
+      return undefined;
+    }
+
+    const result = (await body.json()) as { embedding: number[] };
+
+    if (!Array.isArray(result.embedding) || result.embedding.length !== 384) {
+      return undefined;
+    }
+
+    return result.embedding;
+  } catch (err) {
+    return undefined;
+  }
+}
+
+--- src/interceptor.ts (FIXED) ---
+/**
+ * Interceptor — the main hook that fires on every intent.
+ *
+ * Flow:
+ * 1. User issues an intent (e.g., "login to GitHub")
+ * 2. Interceptor queries ClawMind Cloud for a matching Lobster macro
+ * 3. If hit → execute the Lobster workflow directly (skip LLM exploration)
+ * 4. If miss → passthrough to normal OpenClaw flow
+ * 5. On success → contribute the trace back to the cloud
+ * 6. On failure → report failure for circuit breaker tracking
+ */
+
+import { CloudClient } from "./cloud-client.js";
+import { parseIntent } from "./intent-parser.js";
+import { compileTrace } from "./trace-compiler.js";
+import { generateEmbedding } from "./embedding.js";
+import { sanitizeDomSnapshot } from "./sanitizer.js";
+import type {
+  OpenClawContext,
+  MatchResponse,
+  LobsterExecutionResult,
+} from "./types.js";
+
+export async function interceptIntent(ctx: OpenClawContext): Promise<void> {
+  const { browser, lobster, sessions, gateway, workspace, config, logger } = ctx;
+
+  // Check if skill is enabled
+  if (!config.get<boolean>("enabled")) {
+    gateway.passthrough();
+    return;
+  }
+
+  const cloudEndpoint = config.get<string>("cloud_endpoint");
+  const timeoutMs = config.get<number>("timeout_ms");
+  const client = new CloudClient(cloudEndpoint, timeoutMs, logger);
+
+  const sessionId = sessions.getCurrentSessionId();
+  const history = await sessions.getHistory(sessionId);
+  const intent = history.intent;
+
+  if (!intent) {
+    gateway.passthrough();
+    return;
+  }
+
+  const url = await browser.getCurrentUrl();
+  const domHash = await browser.getDomSkeletonHash();
+  const nodeId = workspace.getNodeId();
+  const parsed = parseIntent(intent, url);
+
+  logger.info(`[ClawMind] Intercepting intent: "${parsed.normalized}" on ${parsed.domain}`);
+
+  // Generate intent embedding for semantic matching
+  let intentEmbedding: number[] | undefined;
+  try {
+    intentEmbedding = await generateEmbedding(parsed.normalized, cloudEndpoint, 2000);
+    if (intentEmbedding) {
+      logger.debug(`[ClawMind] Generated embedding vector (${intentEmbedding.length} dims)`);
+    } else {
+      logger.debug(`[ClawMind] Embedding generation failed, using exact match only`);
+    }
+  } catch (err) {
+    logger.debug(`[ClawMind] Embedding error: ${err}`);
+  }
+
+  // Ensure dom_skeleton_hash is not empty string
+  const cleanDomHash = domHash && domHash.trim() !== "" ? domHash : undefined;
+
+  // Query cloud for a matching macro
+  let matchResult: MatchResponse | null = null;
+  try {
+    matchResult = await client.match({
+      intent: parsed.normalized,
+      intent_embedding: intentEmbedding,
+      url,
+      dom_skeleton_hash: cleanDomHash,
+      node_id: nodeId,
+    });
+  } catch (err) {
+    logger.debug(`[ClawMind] Cloud unreachable: ${err}`);
+    gateway.passthrough();
+    return;
+  }
+
+  // No match — let OpenClaw handle it normally
+  if (!matchResult || !matchResult.hit || !matchResult.macro) {
+    logger.info("[ClawMind] No macro match, passing through to OpenClaw");
+    gateway.passthrough();
+    return;
+  }
+
+  const macro = matchResult.macro;
+  logger.info(
+    `[ClawMind] Match found: ${macro.macro_id} (score: ${matchResult.match_score}, method: ${matchResult.match_method})`
+  );
+
+  // Validate the workflow before execution
+  if (!lobster.validate(macro.lobster_workflow)) {
+    logger.warn(`[ClawMind] Workflow validation failed for ${macro.macro_id}`);
+    gateway.passthrough();
+    return;
+  }
+
+  // Execute the Lobster workflow
+  let execResult: LobsterExecutionResult;
+  try {
+    execResult = await lobster.execute(macro.lobster_workflow);
+  } catch (err) {
+    logger.error(`[ClawMind] Lobster execution threw: ${err}`);
+
+    // P2: Get DOM snapshot on failure and sanitize
+    let domSnapshot: string | undefined;
+    try {
+      const rawDom = await browser.invoke("getOuterHTML", {});
+      if (rawDom.success && typeof rawDom.data === "string") {
+        domSnapshot = sanitizeDomSnapshot(rawDom.data);
+      }
+    } catch {}
+
+    // Report failure to cloud (fire-and-forget)
+    client.reportFailure({
+      macro_id: macro.macro_id,
+      node_id: nodeId,
+      error_type: "other",
+      error_detail: String(err),
+      dom_snapshot: domSnapshot,
+    }).catch(() => {});
+
+    // Fall back to normal OpenClaw flow
+    gateway.passthrough();
+    return;
+  }
+
+  if (execResult.success) {
+    logger.info(
+      `[ClawMind] Macro ${macro.macro_id} executed successfully (${execResult.steps_completed}/${execResult.total_steps} steps)`
+    );
+    gateway.respond(
+      `✅ Done via ClawMind cached workflow (${macro.macro_id}). ` +
+      `${execResult.steps_completed} steps replayed.`
+    );
+  } else {
+    logger.warn(
+      `[ClawMind] Macro ${macro.macro_id} failed at step ${execResult.failed_step_id}: ${execResult.error}`
+    );
+
+    // Map error to error_type
+    const errorType = mapErrorType(execResult.error || "");
+
+    // P2: Get DOM snapshot on failure and sanitize
+    let domSnapshot: string | undefined;
+    try {
+      const rawDom = await browser.invoke("getOuterHTML", {});
+      if (rawDom.success && typeof rawDom.data === "string") {
+        domSnapshot = sanitizeDomSnapshot(rawDom.data);
+      }
+    } catch {}
+
+    client.reportFailure({
+      macro_id: macro.macro_id,
+      node_id: nodeId,
+      error_type: errorType,
+      error_detail: execResult.error,
+      dom_snapshot: domSnapshot,
+      failed_step_id: execResult.failed_step_id,
+    }).catch(() => {});
+
+    // Fall back to normal OpenClaw flow
+    gateway.passthrough();
+  }
+}
+
+/**
+ * Hook: called when a session completes successfully.
+ * Compiles the session trace into a Lobster workflow and contributes it.
+ */
+export async function onSessionComplete(ctx: OpenClawContext): Promise<void> {
+  const { browser, sessions, workspace, config, logger } = ctx;
+
+  if (!config.get<boolean>("enabled") || !config.get<boolean>("auto_contribute")) {
+    return;
+  }
+
+  const sessionId = sessions.getCurrentSessionId();
+  const history = await sessions.getHistory(sessionId);
+
+  // Only contribute successful sessions with meaningful actions
+  if (history.status !== "success") return;
+  if (history.actions.length < 2) return;
+
+  const intent = history.intent;
+  if (!intent) return;
+
+  const url = await browser.getCurrentUrl();
+  const domHash = await browser.getDomSkeletonHash();
+  const nodeId = workspace.getNodeId();
+
+  // Compile the trace into a Lobster workflow
+  const { workflow, argCount } = compileTrace(intent, history.actions);
+
+  // Skip trivial workflows (single step, no real logic)
+  if (workflow.steps.length < 2) {
+    logger.debug("[ClawMind] Workflow too trivial to contribute, skipping");
+    return;
+  }
+
+  logger.info(
+    `[ClawMind] Contributing workflow "${workflow.name}" (${workflow.steps.length} steps, ${argCount} args)`
+  );
+
+  const cloudEndpoint = config.get<string>("cloud_endpoint");
+  const client = new CloudClient(cloudEndpoint, 5000, logger);
+
+  // Generate intent embedding for contribution
+  let intentEmbedding: number[] | undefined;
+  try {
+    intentEmbedding = await generateEmbedding(intent, cloudEndpoint, 2000);
+  } catch (err) {
+    logger.debug(`[ClawMind] Embedding generation failed: ${err}`);
+  }
+
+  // Ensure dom_skeleton_hash is not empty string
+  const cleanDomHash = domHash && domHash.trim() !== "" ? domHash : undefined;
+
+  try {
+    const result = await client.contribute({
+      node_id: nodeId,
+      intent,
+      url,
+      dom_skeleton_hash: cleanDomHash,
+      lobster_workflow: workflow,
+      intent_embedding: intentEmbedding,
+      session_id: sessionId,
+    });
+
+    if (result?.accepted) {
+      logger.info(`[ClawMind] Contribution accepted: ${result.macro_id}`);
+    } else {
+      logger.debug(`[ClawMind] Contribution not accepted: ${result?.reason}`);
+    }
+  } catch (err) {
+    logger.debug(`[ClawMind] Contribution failed: ${err}`);
+  }
+}
+
+function mapErrorType(
+  error: string
+): "selector_not_found" | "timeout" | "unexpected_state" | "other" {
+  const lower = error.toLowerCase();
+  if (lower.includes("selector") || lower.includes("not found") || lower.includes("no element")) {
+    return "selector_not_found";
+  }
+  if (lower.includes("timeout") || lower.includes("timed out")) {
+    return "timeout";
+  }
+  if (lower.includes("unexpected") || lower.includes("state")) {
+    return "unexpected_state";
+  }
+  return "other";
+}
+
+--- src/sanitizer.ts (ENHANCED) ---
+/**
+ * Local PII sanitizer — the primary privacy gate.
+ * Runs BEFORE any data leaves the node.
+ * Strips all identifiable information from action traces
+ * and replaces them with Lobster argument placeholders.
+ */
+
+interface SanitizeResult {
+  sanitized: string;
+  extractedArgs: Map<string, ArgDefinition>;
+}
+
+interface ArgDefinition {
+  type: "string" | "number" | "boolean";
+  placeholder: string;
+  originalPattern: string;
+}
+
+const PII_RULES: Array<{
+  name: string;
+  pattern: RegExp;
+  argType: "string" | "number";
+}> = [
+  {
+    name: "email",
+    pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+    argType: "string",
+  },
+  {
+    name: "phone",
+    pattern: /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g,
+    argType: "string",
+  },
+  {
+    name: "card",
+    pattern: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g,
+    argType: "string",
+  },
+  {
+    name: "ssn",
+    pattern: /\b\d{3}-\d{2}-\d{4}\b/g,
+    argType: "string",
+  },
+  {
+    name: "password",
+    pattern: /(?:password|passwd|pwd)\s*[:=]\s*\S+/gi,
+    argType: "string",
+  },
+  {
+    name: "api_key",
+    pattern: /(?:api[_-]?key|token|secret)\s*[:=]\s*[A-Za-z0-9_\-]{16,}/gi,
+    argType: "string",
+  },
+  {
+    name: "ip_address",
+    pattern: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g,
+    argType: "string",
+  },
+];
+
+// Common user-input field names that likely contain personal data
+const SENSITIVE_FIELD_NAMES = new Set([
+  "username",
+  "user_name",
+  "first_name",
+  "last_name",
+  "full_name",
+  "name",
+  "email",
+  "phone",
+  "address",
+  "street",
+  "city",
+  "zip",
+  "zipcode",
+  "postal_code",
+  "ssn",
+  "social_security",
+  "credit_card",
+  "card_number",
+  "cvv",
+  "expiry",
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "api_key",
+  "dob",
+  "date_of_birth",
+  "birthday",
+]);
+
+export function sanitizeTrace(raw: string): SanitizeResult {
+  let result = raw;
+  const extractedArgs = new Map<string, ArgDefinition>();
+  let argCounter = 0;
+
+  // Pass 1: Regex-based PII detection
+  for (const rule of PII_RULES) {
+    const matches = result.match(rule.pattern);
+    if (matches) {
+      for (const match of new Set(matches)) {
+        const argName = `${rule.name}_${argCounter++}`;
+        const placeholder = `$LOBSTER_ARG_${argName.toUpperCase()}`;
+
+        extractedArgs.set(argName, {
+          type: rule.argType,
+          placeholder,
+          originalPattern: rule.name,
+        });
+
+        result = result.replaceAll(match, placeholder);
+      }
+    }
+    rule.pattern.lastIndex = 0;
+  }
+
+  return { sanitized: result, extractedArgs };
+}
+
+export function sanitizeActionArgs(
+  args: Record<string, unknown>
+): { sanitized: Record<string, unknown>; extractedArgs: Map<string, ArgDefinition> } {
+  const allExtracted = new Map<string, ArgDefinition>();
+  const sanitized: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(args)) {
+    const lowerKey = key.toLowerCase();
+
+    // If the field name itself is sensitive, replace the value entirely
+    if (SENSITIVE_FIELD_NAMES.has(lowerKey)) {
+      const argName = lowerKey;
+      const placeholder = `$LOBSTER_ARG_${argName.toUpperCase()}`;
+
+      allExtracted.set(argName, {
+        type: typeof value === "number" ? "number" : "string",
+        placeholder,
+        originalPattern: `field:${key}`,
+      });
+
+      sanitized[key] = placeholder;
+      continue;
+    }
+
+    // If the value is a string, run PII regex sanitization
+    if (typeof value === "string") {
+      const { sanitized: cleanValue, extractedArgs } = sanitizeTrace(value);
+      sanitized[key] = cleanValue;
+      for (const [k, v] of extractedArgs) {
+        allExtracted.set(k, v);
+      }
+    } else {
+      sanitized[key] = value;
+    }
+  }
+
+  return { sanitized, extractedArgs: allExtracted };
+}
+
+/**
+ * P2: DOM 快照脱敏
+ * 移除敏感信息，防止隐私泄露
+ */
+export function sanitizeDomSnapshot(html: string): string {
+  // 移除密码字段
+  html = html.replace(
+    /<input[^>]*type=["']password["'][^>]*>/gi,
+    '<input type="password" value="[REDACTED]">'
+  );
+
+  // 移除信用卡号（简单模式：连续 13-19 位数字）
+  html = html.replace(/\b\d{13,19}\b/g, "[CARD_REDACTED]");
+
+  // 移除邮箱地址
+  html = html.replace(
+    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
+    "[EMAIL_REDACTED]"
+  );
+
+  // 移除电话号码（国际格式）
+  html = html.replace(
+    /\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}/g,
+    "[PHONE_REDACTED]"
+  );
+
+  // 移除标记为敏感的元素
+  html = html.replace(
+    /<[^>]*data-sensitive[^>]*>.*?<\/[^>]+>/gi,
+    '<div data-sensitive>[REDACTED]</div>'
+  );
+
+  // 移除 SSN（美国社保号）
+  html = html.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN_REDACTED]");
+
+  // 限制快照大小（最多 50KB）
+  if (html.length > 50000) {
+    html = html.substring(0, 50000) + "\n<!-- TRUNCATED -->";
+  }
+
+  return html;
+}
+
+--- src/cloud-client.ts ---
+import { request } from "undici";
+import type {
+  MatchRequest,
+  MatchResponse,
+  ContributeRequest,
+  ContributeResponse,
+  ReportFailureRequest,
+  Logger,
+} from "./types.js";
+
+export class CloudClient {
+  private endpoint: string;
+  private timeoutMs: number;
+  private logger: Logger;
+
+  constructor(endpoint: string, timeoutMs: number, logger: Logger) {
+    this.endpoint = endpoint.replace(/\/$/, "");
+    this.timeoutMs = timeoutMs;
+    this.logger = logger;
+  }
+
+  async match(req: MatchRequest): Promise<MatchResponse | null> {
+    try {
+      const { statusCode, body } = await request(
+        `${this.endpoint}/v1/lobsters/match`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(req),
+          headersTimeout: this.timeoutMs,
+          bodyTimeout: this.timeoutMs,
+        }
+      );
+
+      if (statusCode !== 200) {
+        this.logger.warn(`Cloud match returned ${statusCode}`);
+        return null;
+      }
+
+      return (await body.json()) as MatchResponse;
+    } catch (err) {
+      this.logger.debug(`Cloud match failed (expected on timeout/offline): ${err}`);
+      return null;
+    }
+  }
+
+  async contribute(req: ContributeRequest): Promise<ContributeResponse | null> {
+    try {
+      const { statusCode, body } = await request(
+        `${this.endpoint}/v1/lobsters/contribute`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(req),
+          headersTimeout: 5000,
+          bodyTimeout: 5000,
+        }
+      );
+
+      if (statusCode !== 201 && statusCode !== 409) {
+        this.logger.warn(`Cloud contribute returned ${statusCode}`);
+        return null;
+      }
+
+      return (await body.json()) as ContributeResponse;
+    } catch (err) {
+      this.logger.warn(`Cloud contribute failed: ${err}`);
+      return null;
+    }
+  }
+
+  async reportFailure(req: ReportFailureRequest): Promise<void> {
+    try {
+      await request(`${this.endpoint}/v1/lobsters/report_failure`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(req),
+        headersTimeout: 3000,
+        bodyTimeout: 3000,
+      });
+    } catch (err) {
+      this.logger.debug(`Cloud report_failure failed: ${err}`);
+    }
+  }
+}
+
+--- src/intent-parser.ts ---
+/**
+ * Intent parser — extracts structured intent from natural language
+ * and current browser context. Lightweight local heuristics,
+ * no LLM call needed for basic intent normalization.
+ */
+
+export interface ParsedIntent {
+  raw: string;
+  normalized: string;
+  domain: string;
+  action_verb: string;
+  object_noun: string;
+}
+
+const ACTION_VERBS = new Set([
+  "click", "type", "fill", "submit", "select", "check", "uncheck",
+  "toggle", "scroll", "navigate", "open", "close", "search",
+  "login", "logout", "sign_in", "sign_up", "register",
+  "download", "upload", "delete", "remove", "add", "create",
+  "edit", "update", "save", "cancel", "confirm", "accept",
+  "reject", "deny", "approve", "buy", "purchase", "order",
+  "subscribe", "unsubscribe", "bookmark", "share", "copy",
+  "paste", "drag", "drop", "hover", "wait", "refresh",
+]);
+
+export function parseIntent(raw: string, url: string): ParsedIntent {
+  const normalized = raw
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, "");
+
+  const words = normalized.split(" ");
+
+  // Extract action verb
+  let actionVerb = "interact";
+  for (const word of words) {
+    if (ACTION_VERBS.has(word)) {
+      actionVerb = word;
+      break;
+    }
+  }
+
+  // Extract object noun (first noun-like word after the verb)
+  const verbIndex = words.indexOf(actionVerb);
+  const objectWords = words.slice(verbIndex + 1).filter(
+    (w) => w.length > 2 && !["the", "a", "an", "in", "on", "at", "to", "for", "with"].includes(w)
+  );
+  const objectNoun = objectWords.join("_") || "element";
+
+  // Extract domain from URL
+  let domain = "unknown";
+  try {
+    domain = new URL(url).hostname.replace("www.", "");
+  } catch {
+    // ignore
+  }
+
+  return {
+    raw,
+    normalized,
+    domain,
+    action_verb: actionVerb,
+    object_noun: objectNoun,
+  };
+}
+
+--- src/trace-compiler.ts ---
+/**
+ * Trace Compiler — converts a recorded OpenClaw session trace
+ * into a reusable Lobster workflow.
+ *
+ * This is the core "one node explores, all nodes benefit" engine.
+ * It takes the raw action history from a successful session and
+ * compiles it into a parameterized, portable Lobster workflow.
+ */
+
+import { sanitizeActionArgs } from "./sanitizer.js";
+import type {
+  ActionTrace,
+  LobsterWorkflow,
+  LobsterStep,
+  LobsterArgs,
+} from "./types.js";
+
+export interface CompileResult {
+  workflow: LobsterWorkflow;
+  argCount: number;
+}
+
+export function compileTrace(
+  intentName: string,
+  actions: ActionTrace[]
+): CompileResult {
+  const steps: LobsterStep[] = [];
+  const collectedArgs: LobsterArgs = {};
+  let stepIndex = 0;
+
+  for (const action of actions) {
+    // Skip failed actions — we only want the successful path
+    if (!action.result.success) continue;
+
+    // Skip non-browser actions (internal bookkeeping, etc.)
+    if (!isBrowserAction(action)) continue;
+
+    // Sanitize args to strip PII and extract Lobster arguments
+    const { sanitized, extractedArgs } = sanitizeActionArgs(action.args);
+
+    // Register extracted args in the workflow args definition
+    for (const [argName, argDef] of extractedArgs) {
+      if (!collectedArgs[argName]) {
+        collectedArgs[argName] = {
+          type: argDef.type,
+          required: true,
+        };
+      }
+    }
+
+    // Build the Lobster command string
+    const command = buildCommand(action.tool, action.action, sanitized);
+
+    const step: LobsterStep = {
+      id: `step_${stepIndex++}`,
+      command,
+      timeout_ms: inferTimeout(action),
+    };
+
+    // Merge consecutive waits
+    if (steps.length > 0 && isWaitStep(step) && isWaitStep(steps[steps.length - 1])) {
+      const prev = steps[steps.length - 1];
+      prev.timeout_ms = (prev.timeout_ms || 1000) + (step.timeout_ms || 1000);
+      continue;
+    }
+
+    steps.push(step);
+  }
+
+  // Optimize: remove trailing waits
+  while (steps.length > 0 && isWaitStep(steps[steps.length - 1])) {
+    steps.pop();
+  }
+
+  const workflow: LobsterWorkflow = {
+    name: intentToWorkflowName(intentName),
+    args: collectedArgs,
+    steps,
+  };
+
+  return { workflow, argCount: Object.keys(collectedArgs).length };
+}
+
+function isBrowserAction(action: ActionTrace): boolean {
+  const browserTools = [
+    "browser.click",
+    "browser.type",
+    "browser.fill",
+    "browser.select",
+    "browser.check",
+    "browser.navigate",
+    "browser.scroll",
+    "browser.wait",
+    "browser.hover",
+    "browser.press",
+    "browser.evaluate",
+  ];
+
+  const fullAction = `${action.tool}.${action.action}`;
+  return browserTools.some((bt) => fullAction.startsWith(bt));
+}
+
+function buildCommand(
+  tool: string,
+  action: string,
+  args: Record<string, unknown>
+): string {
+  const argsStr = Object.entries(args)
+    .map(([k, v]) => {
+      if (typeof v === "string") return `${k}="${v}"`;
+      return `${k}=${v}`;
+    })
+    .join(" ");
+
+  return `openclaw.invoke ${tool}.${action} ${argsStr}`.trim();
+}
+
+function inferTimeout(action: ActionTrace): number {
+  const actionName = `${action.tool}.${action.action}`;
+
+  if (actionName.includes("navigate")) return 10000;
+  if (actionName.includes("wait")) return 5000;
+  if (actionName.includes("click")) return 3000;
+  if (actionName.includes("type") || actionName.includes("fill")) return 2000;
+
+  return 3000;
+}
+
+function isWaitStep(step: LobsterStep): boolean {
+  return step.command.includes("browser.wait");
+}
+
+function intentToWorkflowName(intent: string): string {
+  return intent
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .trim()
+    .replace(/\s+/g, "_")
+    .slice(0, 64);
+}
+
+--- src/types.ts ---
+// ===== OpenClaw SDK Types (Skill-side interfaces) =====
+
+export interface OpenClawContext {
+  workspace: WorkspaceAPI;
+  browser: BrowserAPI;
+  lobster: LobsterAPI;
+  sessions: SessionsAPI;
+  gateway: GatewayAPI;
+  config: SkillConfig;
+  logger: Logger;
+}
+
+export interface WorkspaceAPI {
+  getNodeId(): string;
+}
+
+export interface BrowserAPI {
+  getCurrentUrl(): Promise<string>;
+  getDomSkeletonHash(): Promise<string>;
+  invoke(action: string, args: Record<string, unknown>): Promise<BrowserResult>;
+}
+
+export interface BrowserResult {
+  success: boolean;
+  error?: string;
+  data?: unknown;
+}
+
+export interface LobsterAPI {
+  execute(workflow: LobsterWorkflow): Promise<LobsterExecutionResult>;
+  validate(workflow: LobsterWorkflow): boolean;
+}
+
+export interface LobsterExecutionResult {
+  success: boolean;
+  steps_completed: number;
+  total_steps: number;
+  error?: string;
+  failed_step_id?: string;
+}
+
+export interface SessionsAPI {
+  getHistory(sessionId: string): Promise<SessionHistory>;
+  getCurrentSessionId(): string;
+}
+
+export interface SessionHistory {
+  session_id: string;
+  intent: string;
+  actions: ActionTrace[];
+  status: "success" | "failure" | "in_progress";
+  started_at: string;
+  completed_at?: string;
+}
+
+export interface ActionTrace {
+  tool: string;
+  action: string;
+  args: Record<string, unknown>;
+  result: { success: boolean; error?: string };
+  timestamp: string;
+}
+
+export interface GatewayAPI {
+  passthrough(): void;
+  respond(message: string): void;
+}
+
+export interface SkillConfig {
+  get<T>(key: string): T;
+}
+
+export interface Logger {
+  info(msg: string, ...args: unknown[]): void;
+  warn(msg: string, ...args: unknown[]): void;
+  error(msg: string, ...args: unknown[]): void;
+  debug(msg: string, ...args: unknown[]): void;
+}
+
+// ===== Lobster Workflow Types =====
+
+export interface LobsterStep {
+  id: string;
+  command: string;
+  env?: Record<string, string>;
+  timeout_ms?: number;
+}
+
+export interface LobsterArgs {
+  [key: string]: {
+    type: "string" | "number" | "boolean";
+    default?: string | number | boolean;
+    required?: boolean;
+  };
+}
+
+export interface LobsterWorkflow {
+  name: string;
+  args: LobsterArgs;
+  steps: LobsterStep[];
+}
+
+// ===== Cloud API Types =====
+
+export interface MatchRequest {
+  intent: string;
+  intent_embedding?: number[];
+  url: string;
+  dom_skeleton_hash?: string;
+  node_id: string;
+}
+
+export interface MatchResponse {
+  hit: boolean;
+  macro?: {
+    macro_id: string;
+    trigger_context: {
+      intent_embedding: number[];
+      url_regex: string;
+      dom_skeleton_hash?: string;
+    };
+    lobster_workflow: LobsterWorkflow;
+    metadata: {
+      author_node: string;
+      success_rate: number;
+      success_count: number;
+      failure_count: number;
+      last_verified: string;
+      created_at: string;
+    };
+    status: string;
+  };
+  match_score?: number;
+  match_method?: string;
+}
+
+export interface ContributeRequest {
+  node_id: string;
+  intent: string;
+  url: string;
+  dom_skeleton_hash?: string;
+  lobster_workflow: LobsterWorkflow;
+  intent_embedding?: number[];
+  session_id: string;
+}
+
+export interface ContributeResponse {
+  accepted: boolean;
+  macro_id?: string;
+  reason?: string;
+}
+
+export interface ReportFailureRequest {
+  macro_id: string;
+  node_id: string;
+  error_type: "selector_not_found" | "timeout" | "unexpected_state" | "other";
+  error_detail?: string;
+}
+
+--- src/index.ts ---
+/**
+ * ClawMind Skill Entry Point
+ *
+ * Exports the two hooks registered in skill.json:
+ * - interceptIntent: fires on every user intent, queries cloud for cached macros
+ * - onSessionComplete: fires after successful sessions, contributes new workflows
+ */
+
+export { interceptIntent, onSessionComplete } from "./interceptor.js";
+
+--- package.json ---
+{
+  "name": "clawmind-skill",
+  "version": "1.0.0",
+  "description": "ClawMind Local Skill - Lobster Workflow Interceptor for OpenClaw",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "undici": "^7.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
+
+--- skill.json ---
+{
+  "name": "clawmind",
+  "version": "1.0.0",
+  "display_name": "ClawMind (云端智印)",
+  "description": "Global Crowdsourced Lobster Workflow Registry. One node explores, all nodes benefit.",
+  "author": "clawmind-team",
+  "homepage": "https://clawhub.dev/skills/clawmind",
+  "license": "MIT",
+  "entry": "dist/index.js",
+  "permissions": [
+    "browser",
+    "lobster",
+    "sessions_history",
+    "network"
+  ],
+  "hooks": {
+    "on_intent_received": "interceptIntent",
+    "on_session_complete": "onSessionComplete"
+  },
+  "config": {
+    "cloud_endpoint": {
+      "type": "string",
+      "default": "https://api.clawmind.dev",
+      "description": "ClawMind Cloud API endpoint"
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable/disable ClawMind interception"
+    },
+    "auto_contribute": {
+      "type": "boolean",
+      "default": true,
+      "description": "Automatically contribute successful workflows"
+    },
+    "timeout_ms": {
+      "type": "number",
+      "default": 300,
+      "description": "Cloud API timeout in milliseconds"
+    }
+  }
+}
+
